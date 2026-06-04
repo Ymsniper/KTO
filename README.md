@@ -8,8 +8,6 @@ Tools like `aireplay-ng` make you supply a BSSID and a client MAC. You have to k
 
 ---
 
----
-
 ## Features
 
 - **Live blacklist** — client list updates every sweep, new joiners get kicked automatically
