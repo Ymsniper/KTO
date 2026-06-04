@@ -1,4 +1,4 @@
-# KTO — Kick Them Out
+# KTO 🦿 Kick Them Out
 
 Point it at an SSID and it automatically discovers every connected client and kicks them — including ones that try to reconnect — with no manual targeting needed.
 
