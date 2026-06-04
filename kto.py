@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-KTO — Kick Them Out  v1
+KTO — Kick Them Out  v2
 WiFi deauthentication tool.
 
 Kicks all connected devices from a target network, except whitelisted ones.
@@ -11,6 +11,8 @@ Requirements : scapy, aircrack-ng suite (airodump-ng, aireplay-ng, airmon-ng)
 Usage        : sudo python3 kto.py -i wlan0 -t "MyNetwork" [options]
 
 """
+
+VERSION = "2.0"   # keep this in sync with github releases
 
 import argparse
 import os
@@ -32,6 +34,21 @@ try:
 except ImportError:
     print("[-] scapy not found.  pip install scapy")
     sys.exit(1)
+
+
+# ── Update check ─────────────────────────────────────────────────────────────
+
+def _check_update():
+    # runs in background so startup isn't slowed down
+    try:
+        import urllib.request, json
+        url = "https://api.github.com/repos/Ymsniper/KTO/releases/latest"
+        with urllib.request.urlopen(url, timeout=4) as r:
+            latest = json.loads(r.read())["tag_name"].lstrip("v")
+        if latest != VERSION:
+            warn(f"Update available: v{latest}  →  github.com/Ymsniper/KTO")
+    except Exception:
+        pass  # offline, rate limited, no releases yet
 
 
 # ── Terminal colors ─────────────────────────────────────────────────────────
@@ -383,6 +400,8 @@ class KTO:
         auto_monitor: bool,
         auto_bssid: bool,           # auto-pick strongest when SSID has multiple APs
         reason: int,                # 802.11 deauth reason code
+        log_file: str | None,       # path to save kick log, None = disabled
+        live_table: bool,           # live client table (clears screen), off by default
     ):
         self.interface     = interface
         self.ssid          = ssid
@@ -399,6 +418,13 @@ class KTO:
         self.auto_monitor  = auto_monitor
         self.auto_bssid    = auto_bssid
         self.reason        = reason
+        self.live_table    = live_table
+
+        # open log file if given — append so re-runs don't overwrite old sessions
+        self._log_fh = None
+        if log_file:
+            self._log_fh = open(log_file, "a")
+            self._log_fh.write(f"\n# session started {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
         self.target_bssid: str | None   = None
         self.target_channel: int | None = channel
@@ -434,6 +460,13 @@ class KTO:
         if self._mon_created and self.auto_monitor:
             try:
                 disable_monitor_mode(self.interface)
+            except Exception:
+                pass
+
+        if self._log_fh:
+            try:
+                self._log_fh.write(f"# session ended   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                self._log_fh.close()
             except Exception:
                 pass
 
@@ -683,6 +716,13 @@ class KTO:
                 f"Kicked {C.BOLD}{client}{C.RESET}{vendor_tag(client)}"
                 f"  (burst #{burst_n})"
             )
+            # write to log file if --log was given
+            if self._log_fh:
+                vendor = oui_vendor(client) or "unknown"
+                self._log_fh.write(
+                    f"{datetime.now().strftime('%H:%M:%S')}  {client}  {vendor:<14}  burst #{burst_n}\n"
+                )
+                self._log_fh.flush()
         except Exception as e:
             bad(f"Deauth error ({client}): {e}")
 
@@ -757,6 +797,25 @@ class KTO:
                     if self.deauth_delay > 0:
                         time.sleep(self.deauth_delay)
 
+    # ── Live table ───────────────────────────────────────────────────────────
+
+    def _table_loop(self):
+        # refreshes every 2 s — only active when --live-table is set
+        while self._running.is_set():
+            time.sleep(2)
+            with self._stats_lock:
+                stats = dict(self._stats)
+            if not stats:
+                continue
+            os.system("clear")
+            print(f"\n{C.BOLD}{C.RED}  KTO — {self.ssid}{C.RESET}  {C.DIM}{datetime.now().strftime('%H:%M:%S')}{C.RESET}\n")
+            print(f"  {C.DIM}{'MAC':<20} {'Vendor':<16} {'Kicks':>5}{C.RESET}")
+            print(f"  {C.DIM}{'─'*45}{C.RESET}")
+            for mac, n in sorted(stats.items(), key=lambda x: -x[1]):
+                vendor = oui_vendor(mac) or "—"
+                print(f"  {C.BOLD}{mac:<20}{C.RESET} {C.DIM}{vendor:<16}{C.RESET} {C.RED}{n:>5}{C.RESET}")
+            print()
+
     # ── Entry point ──────────────────────────────────────────────────────────
 
     def run(self):
@@ -770,7 +829,7 @@ class KTO:
             self._mon_created = True
             conf.iface      = self.interface
 
-        print(f"\n{C.BOLD}{C.RED}  KTO — Kick Them Out  v3.1{C.RESET}\n")
+        print(f"\n{C.BOLD}{C.RED}  KTO — Kick Them Out  v{VERSION}{C.RESET}\n")
         info(f"Interface  : {self.interface}")
         info(f"Target SSID: {self.ssid}")
         if self.scan_only:
@@ -783,6 +842,8 @@ class KTO:
         if self.whitelist:
             info(f"Whitelist  : {', '.join(self.whitelist)}")
         info(f"Scan dur.  : {self.scan_duration} s   Sweep interval: {self.interval} s")
+        if self._log_fh:
+            info(f"Log file   : {self._log_fh.name}")
         print()
 
         if not self.find_target():
@@ -796,6 +857,9 @@ class KTO:
 
         scan_t = threading.Thread(target=self._scan_loop, daemon=True, name="scan")
         scan_t.start()
+
+        if self.live_table:
+            threading.Thread(target=self._table_loop, daemon=True, name="table").start()
 
         if self.aggressive and not self.scan_only:
             deauth_t = threading.Thread(target=self._deauth_loop, daemon=True, name="deauth")
@@ -834,7 +898,7 @@ def load_whitelist(flag_value: str | None, file_path: str | None) -> set[str]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="KTO v3.1 — Kick Them Out: WiFi deauth tool for authorized pen-testing",
+        description=f"KTO v{VERSION} — Kick Them Out: WiFi deauth tool for authorized pen-testing",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
@@ -848,6 +912,8 @@ examples:
   sudo python3 kto.py -i wlan0mon -t "CorpNet" --scan-duration 12 --delay 0.2
   sudo python3 kto.py -i wlan0mon -t "CorpNet" --auto-bssid   # mesh / multi-AP
   sudo python3 kto.py -i wlan0mon -t "CorpNet" --reason 1     # 1=unspecified
+  sudo python3 kto.py -i wlan0mon -t "CorpNet" --log kicks.txt
+  sudo python3 kto.py -i wlan0mon -t "CorpNet" --live-table
 
 disclaimer:
   Only use on networks you own or have explicit written permission to test.
@@ -893,8 +959,15 @@ disclaimer:
     parser.add_argument("--reason",             type=int, default=7,
                         help="802.11 deauth reason code (default: 7 = class-3-frame). "
                              "Common: 1=unspecified, 4=inactivity, 7=class3-frame")
+    parser.add_argument("--log",                default=None, metavar="FILE",
+                        help="Save a timestamped kick log to a file (appends across sessions)")
+    parser.add_argument("--live-table",         action="store_true",
+                        help="Show a live client table instead of scrolling log (clears screen every 2 s)")
 
     args = parser.parse_args()
+
+    # check for updates in the background, never blocks
+    threading.Thread(target=_check_update, daemon=True).start()
 
     KTO(
         interface     = args.interface,
@@ -912,6 +985,8 @@ disclaimer:
         auto_monitor  = args.auto_monitor,
         auto_bssid    = args.auto_bssid,
         reason        = args.reason,
+        log_file      = args.log,
+        live_table    = args.live_table,
     ).run()
 
 
