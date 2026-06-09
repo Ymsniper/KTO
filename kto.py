@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-KTO — Kick Them Out  v2
+KTO — Kick Them Out  v2.1
 WiFi deauthentication tool.
 
 Kicks all connected devices from a target network, except whitelisted ones.
