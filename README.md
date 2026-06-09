@@ -131,6 +131,8 @@ AA:BB:CC:DD:EE:FF
 
 If the target AP has Protected Management Frames enabled KTO will warn you at startup. Clients with 802.11w support will silently drop unprotected deauth frames, so effectiveness depends on which devices are connected.
 
+However, **in aggressive mode with a high enough deauth burst**, KTO has been observed to still disconnect PMF‑protected clients on some networks—even without a bypass. The sheer volume of frames appears to overwhelm certain implementations. So while PMF is a critical defense, it isn’t bulletproof in every setup.
+
 ---
 
 ## Stopping
