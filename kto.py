@@ -12,7 +12,7 @@ Usage        : sudo python3 kto.py -i wlan0 -t "MyNetwork" [options]
 
 """
 
-VERSION = "2.0"   # keep this in sync with github releases
+VERSION = "2.1"   # keep this in sync with github releases
 
 import argparse
 import os
@@ -326,33 +326,43 @@ def set_channel(interface: str, channel: int):
         warn(f"Could not lock channel {channel}: {e.stderr.decode().strip()}")
 
 
-# FIX 1: robust airmon-ng output parsing
-# Old format: "monitor mode enabled (wlan0mon)"  → captured by paren regex
-# New format: "monitor mode enabled on wlan0mon" → captured by 'on' regex
+# FIX 1: use iw dev to detect the new monitor interface instead of parsing
+# airmon-ng text output — the text format varies too much across versions
+def _list_monitor_ifaces() -> set:
+    try:
+        out = subprocess.run(["iw", "dev"], capture_output=True, text=True, timeout=4).stdout
+        ifaces = set()
+        current = None
+        for line in out.splitlines():
+            line = line.strip()
+            m = re.match(r'Interface\s+(\S+)', line)
+            if m:
+                current = m.group(1)
+            if current and re.match(r'type\s+monitor', line, re.I):
+                ifaces.add(current)
+        return ifaces
+    except Exception:
+        return set()
+
+
 def enable_monitor_mode(iface: str) -> str:
     info(f"Enabling monitor mode on {iface}…")
+    before = _list_monitor_ifaces()
     subprocess.run(["airmon-ng", "check", "kill"], capture_output=True)
-    result = subprocess.run(
-        ["airmon-ng", "start", iface],
-        capture_output=True, text=True,
-    )
-    for line in result.stdout.splitlines():
-        low = line.lower()
-        if "monitor mode" in low and ("enabled" in low or "already" in low):
-            # new airmon-ng: "monitor mode enabled on wlan0mon"
-            m = re.search(r'enabled on (\w+)', low)
-            if m:
-                mon = m.group(1)
-                good(f"Monitor interface: {mon}")
-                return mon
-            # old airmon-ng: "monitor mode enabled (wlan0mon)"
-            m = re.search(r'\((\w+)\)', line)
-            if m:
-                mon = m.group(1)
-                good(f"Monitor interface: {mon}")
-                return mon
+    subprocess.run(["airmon-ng", "start", iface], capture_output=True, text=True)
+    time.sleep(0.5)
+    after = _list_monitor_ifaces()
+    new_ifaces = after - before
+    if new_ifaces:
+        mon = sorted(new_ifaces)[0]
+        good(f"Monitor interface: {mon}")
+        return mon
+    # some drivers switch the same interface to monitor type instead of creating a new one
+    if iface in after:
+        good(f"Monitor interface: {iface}")
+        return iface
     mon = iface + "mon"
-    warn(f"Could not parse monitor interface name — assuming {mon}")
+    warn(f"Could not detect monitor interface — assuming {mon}")
     return mon
 
 def disable_monitor_mode(mon_iface: str):
