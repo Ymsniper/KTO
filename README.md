@@ -83,60 +83,29 @@ let KTO handle it.
 
 ### Arguments
 
-  ---------------------------------------------------------------------------------
-  Flag                      Default                Description
-  ------------------------- ---------------------- --------------------------------
-  `-i`, `--interface`       required               Wireless interface
-                                                   (e.g. `wlan0mon`)
+### Arguments
 
-  `-t`, `--target`          required               Target SSID name
-
-  `-w`, `--whitelist`       ---                    Comma-separated MACs to spare
-
-  `--whitelist-file FILE`   ---                    File of MACs to spare, one per
-                                                   line (`#` = comment)
-
-  `-c`, `--channel`         auto                   Lock to a specific channel
-
-  `-n`, `--count`           5                      Deauth frames per burst per
-                                                   direction
-
-  `-s`, `--sleep`           5.0                    Seconds between sweeps
-
-  `--scan-duration`         8.0                    Seconds airodump-ng listens per
-                                                   sweep
-
-  `--delay`                 0.1                    Per-client delay in aggressive
-                                                   loop
-
-  `--broadcast`             off                    Also deauth `ff:ff:ff:ff:ff:ff`
-
-  `--aireplay`              off                    Use aireplay-ng instead of Scapy
-
-  `--aggressive`            off                    Parallel scan + deauth threads
-
-  `--scan-only`             off                    Passive mode, no frames sent
-
-  `--auto-monitor`          off                    Auto-enable monitor mode via
-                                                   airmon-ng
-
-  `--auto-bssid`            off                    Auto-pick strongest BSSID for
-                                                   mesh / multi-AP SSIDs
-
-  `--reason`                7                      802.11 reason code
-                                                   (1=unspecified, 4=inactivity,
-                                                   7=class3-frame)
-
-  `--log FILE`              ---                    Save timestamped kick log to a
-                                                   file
-
-  `--live-table`            off                    Refreshing client table instead
-                                                   of scrolling output
-
-  `--no-bypass`, `-nb`      off                    Disable experimental PMF bypass
-                                                   entirely (use normal deauths
-                                                   even on WPA2+PMF)
-  ---------------------------------------------------------------------------------
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-i`, `--interface` | required | Wireless interface (e.g. `wlan0mon`) |
+| `-t`, `--target` | required | Target SSID name |
+| `-w`, `--whitelist` | --- | Comma-separated MACs to spare |
+| `--whitelist-file FILE` | --- | File of MACs to spare, one per line (`#` = comment) |
+| `-c`, `--channel` | auto | Lock to a specific channel |
+| `-n`, `--count` | 5 | Deauth frames per burst per direction |
+| `-s`, `--sleep` | 5.0 | Seconds between sweeps |
+| `--scan-duration` | 8.0 | Seconds airodump-ng listens per sweep |
+| `--delay` | 0.1 | Per-client delay in aggressive loop |
+| `--broadcast` | off | Also deauth `ff:ff:ff:ff:ff:ff` |
+| `--aireplay` | off | Use aireplay-ng instead of Scapy |
+| `--aggressive` | off | Parallel scan + deauth threads |
+| `--scan-only` | off | Passive mode, no frames sent |
+| `--auto-monitor` | off | Auto-enable monitor mode via airmon-ng |
+| `--auto-bssid` | off | Auto-pick strongest BSSID for mesh / multi-AP SSIDs |
+| `--reason` | 7 | 802.11 reason code (1=unspecified, 4=inactivity, 7=class3-frame) |
+| `--log FILE` | --- | Save timestamped kick log to a file |
+| `--live-table` | off | Refreshing client table instead of scrolling output |
+| `--no-bypass`, `-nb` | off | Disable experimental PMF bypass |
 
 ------------------------------------------------------------------------
 
