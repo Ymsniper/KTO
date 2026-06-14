@@ -185,8 +185,6 @@ sudo python3 kto.py -i wlan0mon -t "CorpNet" --no-bypass
 
 ## ⚠️ Experimental PMF feature (WPA2+PMF only)
 
-https://github.com/user-attachments/assets/584358e9-ac64-4259-a2cd-09c584ccdba4
-
 Starting with v2.1.6, KTO includes an experimental PMF feature for
 **WPA2-PSK networks with Protected Management Frames (PMF)** enabled.
 When PMF is detected on a WPA2 network, KTO automatically attempts a
