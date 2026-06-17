@@ -31,7 +31,8 @@ from datetime import datetime
 
 # ── Scapy ──────────────────────────────────────────────────────────────────
 try:
-    from scapy.all import RadioTap, Dot11, Dot11Deauth, sendp, conf, EAPOL, Raw, sniff
+    from scapy.all import sendp, conf, EAPOL, Raw, sniff, MANUFDB
+    from scapy.layers.dot11 import RadioTap, Dot11, Dot11Deauth
 except ImportError:
     print("[-] scapy not found.  pip install scapy")
     sys.exit(1)
@@ -88,209 +89,24 @@ def kick(msg):
         print(f"{C.DIM}{_ts()}{C.RESET}  {C.RED}{C.BOLD}[!]{C.RESET} {msg}")
 
 
-# ── OUI vendor lookup ───────────────────────────────────────────────────────
-_OUI: dict[str, str] = {
-    # Apple
-    "00:03:93": "Apple",        "00:0A:27": "Apple",
-    "00:0A:95": "Apple",        "00:11:24": "Apple",
-    "00:14:51": "Apple",        "00:16:CB": "Apple",
-    "00:17:F2": "Apple",        "00:19:E3": "Apple",
-    "00:1B:63": "Apple",        "00:1C:B3": "Apple",
-    "00:1D:4F": "Apple",        "00:1E:52": "Apple",
-    "00:1E:C2": "Apple",        "00:1F:5B": "Apple",
-    "00:1F:F3": "Apple",        "00:21:E9": "Apple",
-    "00:22:41": "Apple",        "00:23:12": "Apple",
-    "00:23:32": "Apple",        "00:23:6C": "Apple",
-    "00:23:DF": "Apple",        "00:24:36": "Apple",
-    "00:25:00": "Apple",        "00:25:4B": "Apple",
-    "00:25:BC": "Apple",        "00:26:08": "Apple",
-    "00:26:4A": "Apple",        "00:26:B9": "Apple",
-    "00:26:BB": "Apple",        "04:0C:CE": "Apple",
-    "04:15:52": "Apple",        "04:1E:64": "Apple",
-    "04:26:65": "Apple",        "04:48:9A": "Apple",
-    "04:54:53": "Apple",        "04:D3:CF": "Apple",
-    "08:00:07": "Apple",        "08:6D:41": "Apple",
-    "08:70:45": "Apple",        "08:74:02": "Apple",
-    "0C:30:21": "Apple",        "0C:3E:9F": "Apple",
-    "0C:4D:E9": "Apple",        "0C:77:1A": "Apple",
-    "0C:BC:9F": "Apple",        "10:1C:0C": "Apple",
-    "10:40:F3": "Apple",        "10:9A:DD": "Apple",
-    "10:DD:B1": "Apple",        "14:10:9F": "Apple",
-    "14:5A:05": "Apple",        "14:8F:C6": "Apple",
-    "14:99:E2": "Apple",        "18:20:32": "Apple",
-    "18:34:51": "Apple",        "18:65:90": "Apple",
-    "18:9E:FC": "Apple",        "18:AF:61": "Apple",
-    "18:E7:F4": "Apple",        "1C:1A:C0": "Apple",
-    "1C:36:BB": "Apple",        "1C:5C:F2": "Apple",
-    "1C:AB:A7": "Apple",        "20:78:F0": "Apple",
-    "20:A2:E4": "Apple",        "20:C9:D0": "Apple",
-    "24:A0:74": "Apple",        "24:AB:81": "Apple",
-    "24:E3:14": "Apple",        "28:0B:5C": "Apple",
-    "28:37:37": "Apple",        "28:6A:B8": "Apple",
-    "28:A0:2B": "Apple",        "28:CF:DA": "Apple",
-    "28:CF:E9": "Apple",        "28:E0:2C": "Apple",
-    "2C:1F:23": "Apple",        "2C:20:0B": "Apple",
-    "2C:61:F6": "Apple",        "2C:B4:3A": "Apple",
-    "2C:F0:A2": "Apple",        "30:10:B3": "Apple",
-    "30:35:AD": "Apple",        "30:90:AB": "Apple",
-    "30:F7:C5": "Apple",        "34:08:BC": "Apple",
-    "34:15:9E": "Apple",        "34:36:3B": "Apple",
-    "34:51:C9": "Apple",        "34:A3:95": "Apple",
-    "34:AB:37": "Apple",        "34:C0:59": "Apple",
-    "38:0F:4A": "Apple",        "38:48:4C": "Apple",
-    "38:71:DE": "Apple",        "38:C9:86": "Apple",
-    "3C:07:54": "Apple",        "3C:15:C2": "Apple",
-    "3C:D0:F8": "Apple",        "3C:E0:72": "Apple",
-    # Samsung
-    "00:00:F0": "Samsung",      "00:02:78": "Samsung",
-    "00:07:AB": "Samsung",      "00:12:47": "Samsung",
-    "00:15:99": "Samsung",      "00:17:C9": "Samsung",
-    "00:17:D5": "Samsung",      "00:21:19": "Samsung",
-    "00:23:39": "Samsung",      "00:24:54": "Samsung",
-    "00:24:91": "Samsung",      "00:25:38": "Samsung",
-    "00:26:37": "Samsung",      "00:E0:64": "Samsung",
-    "08:08:C2": "Samsung",      "08:D4:0C": "Samsung",
-    "0C:14:20": "Samsung",      "10:1D:C0": "Samsung",
-    "10:30:47": "Samsung",      "10:D5:42": "Samsung",
-    "14:89:FD": "Samsung",      "18:22:7E": "Samsung",
-    "1C:62:B8": "Samsung",      "1C:AF:05": "Samsung",
-    "20:13:E0": "Samsung",      "20:64:32": "Samsung",
-    "24:4B:03": "Samsung",      "24:92:0E": "Samsung",
-    "28:27:BF": "Samsung",      "2C:AE:2B": "Samsung",
-    "30:19:66": "Samsung",      "38:2D:E8": "Samsung",
-    "3C:62:00": "Samsung",      "40:0E:85": "Samsung",
-    # Google / Nest
-    "00:1A:11": "Google",       "08:9E:08": "Google",
-    "1C:F2:9A": "Google",       "20:DF:B9": "Google",
-    "48:D6:D5": "Google",       "54:60:09": "Google",
-    "94:EB:2C": "Google",       "A4:77:33": "Google",
-    "F4:F5:D8": "Google",       "F8:8F:CA": "Google",
-    # Amazon
-    "00:BB:3A": "Amazon",       "04:A2:22": "Amazon",
-    "0C:47:C9": "Amazon",       "34:D2:70": "Amazon",
-    "40:B4:CD": "Amazon",       "44:65:0D": "Amazon",
-    "68:54:FD": "Amazon",       "74:C2:46": "Amazon",
-    "84:D6:D0": "Amazon",       "A0:02:DC": "Amazon",
-    "B4:7C:9C": "Amazon",       "F0:27:2D": "Amazon",
-    "FC:A6:67": "Amazon",
-    # Huawei
-    "00:9A:CD": "Huawei",       "04:02:1F": "Huawei",
-    "04:C0:6F": "Huawei",       "04:F9:38": "Huawei",
-    "08:19:A6": "Huawei",       "10:1B:54": "Huawei",
-    "1C:8E:5C": "Huawei",       "20:F3:A3": "Huawei",
-    "28:31:52": "Huawei",       "2C:AB:25": "Huawei",
-    "34:6B:D3": "Huawei",       "34:A8:4E": "Huawei",
-    "38:37:8B": "Huawei",       "40:4D:8E": "Huawei",
-    # Xiaomi
-    "00:EC:0A": "Xiaomi",       "04:CF:8C": "Xiaomi",
-    "08:7A:4C": "Xiaomi",       "0C:1D:AF": "Xiaomi",
-    "10:2A:B3": "Xiaomi",       "14:F6:5A": "Xiaomi",
-    "18:59:36": "Xiaomi",       "28:6C:07": "Xiaomi",
-    "34:80:B3": "Xiaomi",       "38:A4:ED": "Xiaomi",
-    "4C:49:E3": "Xiaomi",       "50:64:2B": "Xiaomi",
-    "58:44:98": "Xiaomi",       "5C:02:14": "Xiaomi",
-    "64:09:80": "Xiaomi",       "64:B4:73": "Xiaomi",
-    "68:DF:DD": "Xiaomi",       "6C:5A:B0": "Xiaomi",
-    "74:51:BA": "Xiaomi",       "78:11:DC": "Xiaomi",
-    "78:02:F8": "Xiaomi",       "7C:1D:D9": "Xiaomi",
-    "8C:BE:BE": "Xiaomi",       "94:FB:A7": "Xiaomi",
-    "98:FA:E3": "Xiaomi",       "9C:99:A0": "Xiaomi",
-    "A0:86:C6": "Xiaomi",       "AC:C1:EE": "Xiaomi",
-    "B0:E2:35": "Xiaomi",       "C4:0B:CB": "Xiaomi",
-    "D4:97:0B": "Xiaomi",       "F0:B4:29": "Xiaomi",
-    "F4:8B:32": "Xiaomi",       "F8:A4:5F": "Xiaomi",
-    "FC:64:BA": "Xiaomi",
-    # Sony
-    "00:13:A9": "Sony",         "00:19:4E": "Sony",
-    "00:1A:80": "Sony",         "00:1D:0D": "Sony",
-    "00:24:BE": "Sony",         "00:EB:2D": "Sony",
-    "10:4F:58": "Sony",         "30:17:C8": "Sony",
-    "3C:01:EF": "Sony",         "40:2B:A1": "Sony",
-    "5C:F9:38": "Sony",         "70:2A:D5": "Sony",
-    "AC:9B:0A": "Sony",         "B4:52:7E": "Sony",
-    "D8:D4:3C": "Sony",         "E0:AE:5E": "Sony",
-    # Intel
-    "00:02:B3": "Intel",        "00:03:47": "Intel",
-    "00:04:23": "Intel",        "00:07:E9": "Intel",
-    "00:0C:F1": "Intel",        "00:0E:0C": "Intel",
-    "00:0E:35": "Intel",        "00:11:11": "Intel",
-    "00:12:F0": "Intel",        "00:13:02": "Intel",
-    "00:13:20": "Intel",        "00:13:CE": "Intel",
-    "00:13:E8": "Intel",        "00:15:00": "Intel",
-    "00:15:17": "Intel",        "00:16:6F": "Intel",
-    "00:16:76": "Intel",        "00:16:EA": "Intel",
-    "00:16:EB": "Intel",        "00:18:DE": "Intel",
-    # Realtek
-    "00:01:6C": "Realtek",      "00:E0:4C": "Realtek",
-    "08:BE:AC": "Realtek",
-    # TP-Link
-    "00:27:19": "TP-Link",      "14:CC:20": "TP-Link",
-    "18:D6:C7": "TP-Link",      "1C:3B:F3": "TP-Link",
-    "20:DC:E6": "TP-Link",      "24:A4:3C": "TP-Link",
-    "28:2C:B2": "TP-Link",      "2C:D0:5A": "TP-Link",
-    "30:B5:C2": "TP-Link",      "3C:46:D8": "TP-Link",
-    "50:C7:BF": "TP-Link",      "54:C8:0F": "TP-Link",
-    "60:32:B1": "TP-Link",      "60:E3:27": "TP-Link",
-    "64:70:02": "TP-Link",      "6C:5C:14": "TP-Link",
-    "74:EA:3A": "TP-Link",      "78:8A:20": "TP-Link",
-    "7C:39:56": "TP-Link",      "80:35:C1": "TP-Link",
-    "84:16:F9": "TP-Link",      "88:D7:F6": "TP-Link",
-    "90:F6:52": "TP-Link",      "98:DA:C4": "TP-Link",
-    "A0:F3:C1": "TP-Link",      "A8:40:41": "TP-Link",
-    "AC:84:C6": "TP-Link",      "B0:95:75": "TP-Link",
-    "B4:B0:24": "TP-Link",      "C0:4A:00": "TP-Link",
-    "D8:07:B6": "TP-Link",      "DC:FE:18": "TP-Link",
-    "E8:DE:27": "TP-Link",      "EC:08:6B": "TP-Link",
-    "F4:F2:6D": "TP-Link",      "F8:1A:67": "TP-Link",
-    # Netgear
-    "00:09:5B": "Netgear",      "00:0F:B5": "Netgear",
-    "00:14:6C": "Netgear",      "00:1B:2F": "Netgear",
-    "00:1E:2A": "Netgear",      "00:1F:33": "Netgear",
-    "00:22:3F": "Netgear",      "00:24:B2": "Netgear",
-    "00:26:F2": "Netgear",      "20:4E:7F": "Netgear",
-    "2C:30:33": "Netgear",      "2C:B0:5D": "Netgear",
-    "44:94:FC": "Netgear",      "4C:60:DE": "Netgear",
-    # Asus
-    "00:08:A1": "Asus",         "00:0C:6E": "Asus",
-    "00:0E:A6": "Asus",         "00:11:2F": "Asus",
-    "00:13:D4": "Asus",         "00:15:F2": "Asus",
-    "00:17:31": "Asus",         "00:18:F3": "Asus",
-    "00:1A:92": "Asus",         "00:1B:FC": "Asus",
-    "00:1D:60": "Asus",         "00:1E:8C": "Asus",
-    "00:1F:C6": "Asus",         "00:22:15": "Asus",
-    "00:23:54": "Asus",         "00:24:8C": "Asus",
-    "00:26:18": "Asus",         "04:92:26": "Asus",
-    # LG
-    "00:1C:62": "LG",           "00:1E:75": "LG",
-    "00:1F:6B": "LG",           "00:22:A9": "LG",
-    "00:24:83": "LG",           "00:26:E2": "LG",
-    "10:68:3F": "LG",           "1C:08:C1": "LG",
-    # OnePlus
-    "AC:37:43": "OnePlus",      "BC:28:A3": "OnePlus",
-    # Microsoft / Xbox
-    "00:50:F2": "Microsoft",    "28:18:78": "Microsoft",
-    "48:DF:37": "Microsoft",    "60:45:BD": "Microsoft",
-    "7C:1E:52": "Microsoft",    "98:5F:D3": "Microsoft",
-    "C0:33:5E": "Microsoft",
-    # Nintendo
-    "00:09:BF": "Nintendo",     "00:16:56": "Nintendo",
-    "00:17:AB": "Nintendo",     "00:19:1D": "Nintendo",
-    "00:1A:E9": "Nintendo",     "00:1B:EA": "Nintendo",
-    "00:1C:BE": "Nintendo",     "00:1E:35": "Nintendo",
-    "00:1F:32": "Nintendo",     "00:21:47": "Nintendo",
-    "00:22:AA": "Nintendo",     "00:24:44": "Nintendo",
-    "E0:E7:51": "Nintendo",
-    # VirtualBox / VMware (useful for lab environments)
-    "08:00:27": "VirtualBox",
-    "00:0C:29": "VMware",       "00:50:56": "VMware",
-    "00:05:69": "VMware",
-}
-
+manufdb = MANUFDB
 MAC_RE = re.compile(r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$')
 
 
 def oui_vendor(mac: str) -> str:
-    return _OUI.get(mac.upper()[:8], "")
+    try:
+        if int(mac.replace(":", "")[:2], 16) & 0x02:
+            return ""
+    except Exception:
+        return ""
+    try:
+        result = manufdb.lookup(mac)
+        if result is None:
+            return ""
+        name = result[0] or ""
+        return "" if name.upper() == mac.upper() else name
+    except Exception:
+        return ""
 
 def vendor_tag(mac: str) -> str:
     v = oui_vendor(mac)
@@ -319,7 +135,7 @@ def check_dependency(tool: str):
 def set_channel(interface: str, channel: int):
     try:
         subprocess.run(
-            ["iwconfig", interface, "channel", str(channel)],
+            ["iw", interface, "channel", str(channel)],
             check=True, capture_output=True,
         )
         good(f"Channel locked to {channel}")
