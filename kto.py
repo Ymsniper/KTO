@@ -31,7 +31,8 @@ from datetime import datetime
 
 # ── Scapy ──────────────────────────────────────────────────────────────────
 try:
-    from scapy.all import RadioTap, Dot11, Dot11Deauth, sendp, conf, EAPOL, Raw, sniff
+    from scapy.all import sendp, conf, EAPOL, Raw, sniff, MANUFDB
+    from scapy.layers.dot11 import RadioTap, Dot11, Dot11Deauth
 except ImportError:
     print("[-] scapy not found.  pip install scapy")
     sys.exit(1)
@@ -93,7 +94,19 @@ MAC_RE = re.compile(r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$')
 
 
 def oui_vendor(mac: str) -> str:
-    return manufdb.lookup(mac)[1]
+    try:
+        if int(mac.replace(":", "")[:2], 16) & 0x02:
+            return ""
+    except Exception:
+        return ""
+    try:
+        result = manufdb.lookup(mac)
+        if result is None:
+            return ""
+        name = result[0] or ""
+        return "" if name.upper() == mac.upper() else name
+    except Exception:
+        return ""
 
 def vendor_tag(mac: str) -> str:
     v = oui_vendor(mac)
